@@ -32,8 +32,12 @@ def calculate_lot_size(balance, risk_percentage, symbol, entry_price, sl):
     This handles various asset classes, including exotic forex pairs, metals, commodities, and indices.
     """
     # Ensure entry_price and sl are floats
-    entry_price = float(entry_price)
-    sl = float(sl)
+    try:
+        entry_price = float(entry_price)
+        sl = float(sl)
+    except ValueError as e:
+        print(f"Error converting entry price or SL to float: {e}")
+        return None
 
     # Calculate the risk amount based on the balance and risk percentage
     risk_amount = balance * (risk_percentage / 100)
@@ -93,11 +97,21 @@ def calculate_lot_size(balance, risk_percentage, symbol, entry_price, sl):
 def parse_trade_signal(message):
     """
     Parse trade signals from the message content.
-    Extended format: ORDER_TYPE ORDER_KIND SYMBOL RISK_PERCENT ENTRY_PRICE SL TP [EXPIRATION] [COMMENT]
-    Example: SELL LIMIT XAUUSD 1.5% 2558 2573.6 2520 DAY my_trade
+    Extended format: ORDER_TYPE ORDER_KIND SYMBOL RISK_PERCENT/FIXED_LOT ENTRY_PRICE SL TP [EXPIRATION] [COMMENT]
+    Example:
+        SELL LIMIT BTCUSD 50% 93984.85 94984.85 92984.85
+        SELL LIMIT BTCUSD 0.01 93984.85 94984.85 92984.85
     """
     try:
-        pattern = r"(?P<order_type>BUY|SELL)\s+(?P<order_kind>LIMIT|STOP|MARKET)\s+(?P<symbol>\w+)\s+(?P<risk_percentage>\d*\.?\d+)%\s+(?P<entry_price>\d*\.?\d+)\s+(?P<sl>\d*\.?\d+)\s+(?P<tp>\d*\.?\d+)(?:\s+(?P<expiration>DAY|WEEK))?(?:\s+(?P<comment>[^\s]+))?"
+        pattern = (
+            r"(?P<order_type>BUY|SELL)\s+"
+            r"(?P<order_kind>LIMIT|STOP|MARKET)\s+"
+            r"(?P<symbol>\w+)\s+"
+            r"(?P<risk_or_lot>\d*\.?\d+%|\d*\.?\d+)\s+"
+            r"(?P<entry_price>\d*\.?\d+)\s+"
+            r"(?P<sl>\d*\.?\d+)\s+"
+            r"(?P<tp>\d*\.?\d+)(?:\s+(?P<expiration>DAY|WEEK))?(?:\s+(?P<comment>[^\s]+))?"
+        )
         match = re.match(pattern, message)
         if match:
             return match.groupdict()
@@ -107,9 +121,9 @@ def parse_trade_signal(message):
         print(f"Error parsing signal: {e}")
         return None
 
-def place_trade(order_type, order_kind, symbol, risk_percentage, entry_price, sl, tp, comment=None, expiration=None):
+def place_trade(order_type, order_kind, symbol, risk_or_lot, entry_price, sl, tp, comment=None, expiration=None):
     """
-    Places a trade on MT5 with the given parameters using risk percentage-based position sizing.
+    Places a trade on MT5 with the given parameters using either risk percentage or fixed lot size.
     """
     try:
         # Ensure the symbol is available in the Market Watch
@@ -120,28 +134,30 @@ def place_trade(order_type, order_kind, symbol, risk_percentage, entry_price, sl
         # Get account info for balance
         account_info = mt5.account_info()
         if not account_info:
-            print("Failed to get account info")
+            print("Failed to retrieve account information")
             return False
-            
-        print(f"Account Info:")
-        print(f"  Balance: {account_info.balance}")
-        print(f"  Equity: {account_info.equity}")
-        print(f"  Margin: {account_info.margin}")
-        print(f"  Free Margin: {account_info.margin_free}")
-        
+
+        balance = account_info.balance
+        print(f"Account Balance: {balance}")
+
         # Get symbol info
         symbol_info = mt5.symbol_info(symbol)
         if not symbol_info:
             print(f"Symbol info not found for {symbol}")
             return False
-        
-        # Calculate lot size based on risk percentage
-        volume = calculate_lot_size(account_info.balance, float(risk_percentage), symbol, entry_price, sl)
-        if volume is None:
-            print("Failed to calculate lot size")
+
+        # Calculate lot size
+        if "%" in risk_or_lot:  # Risk percentage
+            risk_percentage = float(risk_or_lot.strip('%'))
+            volume = calculate_lot_size(balance, risk_percentage, symbol, entry_price, sl)
+        else:  # Fixed lot size
+            volume = float(risk_or_lot)
+
+        if volume is None or volume < symbol_info.volume_min or volume > symbol_info.volume_max:
+            print(f"Invalid lot size: {volume}. Must be between {symbol_info.volume_min} and {symbol_info.volume_max}.")
             return False
 
-        # Convert string values to proper numeric types
+        # Convert inputs to numeric types
         try:
             entry_price = float(entry_price)
             sl = float(sl)
@@ -150,20 +166,18 @@ def place_trade(order_type, order_kind, symbol, risk_percentage, entry_price, sl
             print(f"Error converting numeric values: {e}")
             return False
 
-        # Check for valid volume
-        if volume < symbol_info.volume_min or volume > symbol_info.volume_max:
-            print(f"Invalid volume: {volume} for {symbol}. Min: {symbol_info.volume_min}, Max: {symbol_info.volume_max}")
-            return False
-
-        # Determine the order type for MT5
+        # Determine order type for MT5
         if order_kind.upper() == "LIMIT":
             order_type_mt5 = mt5.ORDER_TYPE_BUY_LIMIT if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL_LIMIT
         elif order_kind.upper() == "STOP":
             order_type_mt5 = mt5.ORDER_TYPE_BUY_STOP if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL_STOP
-        else:  # MARKET
+        elif order_kind.upper() == "MARKET":
             order_type_mt5 = mt5.ORDER_TYPE_BUY if order_type.upper() == "BUY" else mt5.ORDER_TYPE_SELL
+        else:
+            print(f"Invalid order kind: {order_kind}")
+            return False
 
-        # Create the base request without expiration and comment
+        # Prepare order request
         request = {
             "action": mt5.TRADE_ACTION_PENDING if order_kind != "MARKET" else mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
@@ -175,66 +189,50 @@ def place_trade(order_type, order_kind, symbol, risk_percentage, entry_price, sl
             "deviation": 20,
             "magic": 234000,
             "type_filling": mt5.ORDER_FILLING_IOC,
+            "type_time": mt5.ORDER_TIME_GTC,  # Default Good-Till-Cancelled
         }
 
-        print("\nTrade Request Details:")
-        print(f"  Action: {'PENDING' if order_kind != 'MARKET' else 'DEAL'}")
-        print(f"  Symbol: {symbol}")
-        print(f"  Volume: {volume}")
-        print(f"  Order Type: {order_type_mt5}")
-        print(f"  Entry Price: {entry_price}")
-        print(f"  Stop Loss: {sl}")
-        print(f"  Take Profit: {tp}")
-        
-        # Add comment only if provided
-        if comment:
-            request["comment"] = comment
-        else:
-            request["comment"] = ""
-
-        # Add expiration only if provided
+        # Handle expiration
         if expiration:
             current_time = datetime.now()
             if expiration.upper() == "DAY":
-                expiration_time = int(current_time.replace(hour=23, minute=59, second=59, microsecond=0).timestamp())
-                request["type_time"] = mt5.ORDER_TIME_SPECIFIED
-                request["expiration"] = expiration_time
+                expiration_time = int(current_time.replace(hour=23, minute=59, second=59).timestamp())
             elif expiration.upper() == "WEEK":
-                days_until_friday = (4 - current_time.weekday()) % 5
-                if days_until_friday == 0 and current_time.hour >= 23:
-                    days_until_friday = 5
-                expiration_time = int((current_time + timedelta(days=days_until_friday)).replace(hour=23, minute=59, second=59, microsecond=0).timestamp())
-                request["type_time"] = mt5.ORDER_TIME_SPECIFIED
-                request["expiration"] = expiration_time
-        else:
-            request["type_time"] = mt5.ORDER_TIME_GTC
-            # Don't include expiration field when not needed
+                days_until_friday = (4 - current_time.weekday()) % 7
+                expiration_time = int((current_time + timedelta(days=days_until_friday)).replace(hour=23, minute=59, second=59).timestamp())
+            else:
+                print(f"Invalid expiration value: {expiration}")
+                return False
+            request["type_time"] = mt5.ORDER_TIME_SPECIFIED
+            request["expiration"] = expiration_time
 
-        # Print the request for debugging
-        print(f"Sending order request: {request}")
+        # Add optional comment
+        if comment:
+            request["comment"] = comment
 
-        # Send the order
+        # Log the request for debugging
+        print("\nOrder Request:")
+        for key, value in request.items():
+            print(f"  {key}: {value}")
+
+        # Send order request
         result = mt5.order_send(request)
-        
+
         if result is None:
             error_code = mt5.last_error()
             print(f"Order failed with error code: {error_code}")
             return False
-            
+
         if result.retcode != mt5.TRADE_RETCODE_DONE:
             print(f"Order failed: {result.retcode} - {mt5.last_error()}")
             return False
-        
+
         print(f"Order placed successfully: {result}")
         return True
 
     except Exception as e:
         print(f"Unexpected error in place_trade: {str(e)}")
         return False
-
-@client.event
-async def on_ready():
-    print(f'{client.user} has connected to Discord!')
 
 @client.event
 async def on_message(message):
@@ -252,7 +250,7 @@ async def on_message(message):
                     order_type=trade_signal['order_type'],
                     order_kind=trade_signal['order_kind'],
                     symbol=trade_signal['symbol'],
-                    risk_percentage=trade_signal['risk_percentage'].replace('%', ''),
+                    risk_or_lot=trade_signal['risk_or_lot'],  # Corrected parameter name
                     entry_price=trade_signal['entry_price'],
                     sl=trade_signal['sl'],
                     tp=trade_signal['tp'],
